@@ -20,12 +20,25 @@ jobs:
     timeout-minutes: 240
     env:
       CARGO_INCREMENTAL: 0
+      CARGO_HOME: D:\c
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
       # The upstream CI value enables Azure signing, whose credentials are only
       # available in the zed-industries repository. Fork builds are unsigned.
       CI: ""
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Enable long paths
+        shell: pwsh
+        run: |
+          git config --system core.longpaths true
+          New-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" `
+            -Name LongPathsEnabled `
+            -Value 1 `
+            -PropertyType DWORD `
+            -Force | Out-Null
 
       - name: Cache Rust build data
         uses: Swatinem/rust-cache@v2
