@@ -48,6 +48,7 @@ pub struct DiffMultibuffer {
     multibuffer: Entity<MultiBuffer>,
     branch_diff: Entity<diff_buffer_list::DiffBufferList>,
     editor: Entity<SplittableEditor>,
+    file_entries: Vec<DiffFileEntry>,
     buffer_subscriptions: HashMap<RepoPath, BufferSubscriptions>,
     workspace: WeakEntity<Workspace>,
     focus_handle: FocusHandle,
@@ -56,6 +57,12 @@ pub struct DiffMultibuffer {
     empty_label: SharedString,
     _task: Task<Result<()>>,
     _subscription: Subscription,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DiffFileEntry {
+    pub(crate) repo_path: RepoPath,
+    pub(crate) status: FileStatus,
 }
 
 impl DiffMultibuffer {
@@ -162,6 +169,7 @@ impl DiffMultibuffer {
             focus_handle,
             editor,
             multibuffer,
+            file_entries: Vec::new(),
             buffer_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
@@ -204,6 +212,10 @@ impl DiffMultibuffer {
         &self.multibuffer
     }
 
+    pub(crate) fn file_entries(&self) -> &[DiffFileEntry] {
+        &self.file_entries
+    }
+
     pub(crate) fn move_to_entry(
         &mut self,
         entry: GitStatusEntry,
@@ -241,6 +253,20 @@ impl DiffMultibuffer {
             .unwrap_or(FileStatus::Untracked);
         let path_key = project_diff_path_key(&git_repo.read(cx), &repo_path, status, cx);
         self.move_to_path(path_key, window, cx)
+    }
+
+    pub(crate) fn move_to_repo_path(
+        &mut self,
+        repo_path: &RepoPath,
+        status: FileStatus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
+            return;
+        };
+        let path_key = project_diff_path_key(&git_repo.read(cx), repo_path, status, cx);
+        self.move_to_path(path_key, window, cx);
     }
 
     pub(crate) fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -625,6 +651,13 @@ impl DiffMultibuffer {
                     entries.insert(path_key, diff_buffer);
                 }
             }
+            this.file_entries = entries
+                .values()
+                .map(|entry| DiffFileEntry {
+                    repo_path: entry.repo_path.clone(),
+                    status: entry.file_status,
+                })
+                .collect();
 
             let repo_path_by_display_id = this
                 .buffer_subscriptions

@@ -1,20 +1,24 @@
 use crate::{
     branch_picker,
-    diff_multibuffer::DiffMultibuffer,
+    diff_multibuffer::{DiffFileEntry, DiffMultibuffer},
+    git_status_icon,
     project_diff::{
         self, CompareWithBranch, DeployBranchDiff, ReviewDiff, render_send_review_to_agent_button,
     },
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
+use collections::{BTreeMap, HashMap};
 use editor::{
     Addon, Editor, EditorEvent, RestoreOnlyDiffHunkDelegate, SplittableEditor,
     actions::SendReviewToAgent,
 };
+use file_icons::FileIcons;
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
+    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
+    actions, px, uniform_list,
 };
 use language::{BufferId, Capability};
 use project::{
@@ -27,9 +31,14 @@ use project::{
 use settings::Settings;
 use std::{
     any::{Any, TypeId},
+    ops::Range,
+    rc::Rc,
     sync::Arc,
 };
-use ui::{DiffStat, Divider, PopoverMenu, Tooltip, prelude::*};
+use ui::{
+    DiffStat, Divider, IndentGuideColors, ListItem, ListItemSpacing, PopoverMenu, Tooltip,
+    WithScrollbar, prelude::*,
+};
 use workspace::{
     ItemHandle, ItemNavHistory, SerializableItem, ToolbarItemEvent, ToolbarItemLocation,
     ToolbarItemView, Workspace,
@@ -38,6 +47,17 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 use zed_actions::agent::ReviewBranchDiff;
+
+const BRANCH_DIFF_TREE_WIDTH: Pixels = px(240.);
+const TREE_INDENT: f32 = 20.;
+
+actions!(
+    git,
+    [
+        /// Toggles the file tree in the branch diff view.
+        ToggleBranchDiffTree
+    ]
+);
 
 /// The workspace item for a branch (merge-base) diff: "Changes since {branch}".
 /// It wraps a single [`DiffMultibuffer`] over [`DiffBase::Merge`] and delegates
@@ -48,7 +68,139 @@ pub struct BranchDiff {
     diff: Entity<DiffMultibuffer>,
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
-    _diff_event_subscription: Subscription,
+    show_tree: bool,
+    tree_expanded_dirs: HashMap<git::repository::RepoPath, bool>,
+    tree_scroll_handle: UniformListScrollHandle,
+    _subscriptions: Subscription,
+}
+
+enum BranchDiffTreeEntry {
+    Directory(BranchDiffDirectoryEntry),
+    File(BranchDiffTreeFileEntry),
+}
+
+impl BranchDiffTreeEntry {
+    fn depth(&self) -> usize {
+        match self {
+            Self::Directory(entry) => entry.depth,
+            Self::File(entry) => entry.depth,
+        }
+    }
+}
+
+struct BranchDiffTreeFileEntry {
+    entry: DiffFileEntry,
+    depth: usize,
+}
+
+struct BranchDiffDirectoryEntry {
+    path: git::repository::RepoPath,
+    name: SharedString,
+    depth: usize,
+    expanded: bool,
+}
+
+#[derive(Default)]
+struct BranchDiffTreeNode {
+    name: SharedString,
+    path: Option<git::repository::RepoPath>,
+    children: BTreeMap<SharedString, BranchDiffTreeNode>,
+    files: Vec<DiffFileEntry>,
+}
+
+fn build_branch_diff_tree_entries(
+    mut files: Vec<DiffFileEntry>,
+    expanded_dirs: &HashMap<git::repository::RepoPath, bool>,
+) -> Vec<BranchDiffTreeEntry> {
+    files.sort_by(|a, b| a.repo_path.cmp(&b.repo_path));
+
+    let mut root = BranchDiffTreeNode::default();
+    for file in files {
+        let components: Vec<&str> = file.repo_path.components().collect();
+        if components.is_empty() {
+            root.files.push(file);
+            continue;
+        }
+
+        let mut current = &mut root;
+        let mut current_path = String::new();
+        for (ix, component) in components.iter().enumerate() {
+            if ix == components.len() - 1 {
+                current.files.push(file.clone());
+            } else {
+                if !current_path.is_empty() {
+                    current_path.push('/');
+                }
+                current_path.push_str(component);
+
+                let Ok(path) = git::repository::RepoPath::new(&current_path) else {
+                    continue;
+                };
+                let name = SharedString::from(component.to_string());
+                current =
+                    current
+                        .children
+                        .entry(name.clone())
+                        .or_insert_with(|| BranchDiffTreeNode {
+                            name,
+                            path: Some(path),
+                            ..Default::default()
+                        });
+            }
+        }
+    }
+
+    flatten_branch_diff_tree(&root, 0, expanded_dirs)
+}
+
+fn flatten_branch_diff_tree(
+    node: &BranchDiffTreeNode,
+    depth: usize,
+    expanded_dirs: &HashMap<git::repository::RepoPath, bool>,
+) -> Vec<BranchDiffTreeEntry> {
+    let mut entries = Vec::new();
+    for child in node.children.values() {
+        let (terminal, name) = compact_branch_diff_directory_chain(child);
+        let Some(path) = terminal.path.clone().or_else(|| child.path.clone()) else {
+            continue;
+        };
+        let expanded = *expanded_dirs.get(&path).unwrap_or(&true);
+        let child_entries = flatten_branch_diff_tree(terminal, depth + 1, expanded_dirs);
+
+        entries.push(BranchDiffTreeEntry::Directory(BranchDiffDirectoryEntry {
+            path,
+            name,
+            depth,
+            expanded,
+        }));
+        if expanded {
+            entries.extend(child_entries);
+        }
+    }
+    entries.extend(
+        node.files
+            .iter()
+            .cloned()
+            .map(|entry| BranchDiffTreeEntry::File(BranchDiffTreeFileEntry { entry, depth })),
+    );
+    entries
+}
+
+fn compact_branch_diff_directory_chain(
+    mut node: &BranchDiffTreeNode,
+) -> (&BranchDiffTreeNode, SharedString) {
+    let mut parts = vec![node.name.clone()];
+    while node.files.is_empty() && node.children.len() == 1 {
+        let Some(child) = node.children.values().next() else {
+            break;
+        };
+        if child.path.is_none() {
+            break;
+        }
+        parts.push(child.name.clone());
+        node = child;
+    }
+    (node, SharedString::from(parts.join("/")))
 }
 
 struct BranchDiffAddon {
@@ -322,14 +474,196 @@ impl BranchDiff {
         cx: &mut Context<Self>,
     ) -> Self {
         let diff_event_subscription = cx.subscribe(&diff, |_, _, event: &EditorEvent, cx| {
-            cx.emit(event.clone())
+            cx.emit(event.clone());
+            cx.notify();
         });
+        let diff_observation = cx.observe(&diff, |_, _, cx| cx.notify());
         Self {
             diff,
             project,
             workspace: workspace.downgrade(),
-            _diff_event_subscription: diff_event_subscription,
+            show_tree: true,
+            tree_expanded_dirs: HashMap::default(),
+            tree_scroll_handle: UniformListScrollHandle::new(),
+            _subscriptions: Subscription::join(diff_event_subscription, diff_observation),
         }
+    }
+
+    fn toggle_tree(&mut self, _: &ToggleBranchDiffTree, _: &mut Window, cx: &mut Context<Self>) {
+        self.show_tree = !self.show_tree;
+        self.tree_scroll_handle
+            .scroll_to_item(0, ScrollStrategy::Top);
+        cx.notify();
+    }
+
+    fn active_repo_path(&self, cx: &App) -> Option<git::repository::RepoPath> {
+        let project_path = self.diff.read(cx).active_project_path(cx)?;
+        let repo = self.diff.read(cx).repo(cx)?;
+        repo.read(cx).project_path_to_repo_path(&project_path, cx)
+    }
+
+    fn render_tree_entry(
+        &self,
+        ix: usize,
+        entry: &BranchDiffTreeEntry,
+        active_path: Option<&git::repository::RepoPath>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        match entry {
+            BranchDiffTreeEntry::Directory(entry) => {
+                let path = entry.path.clone();
+                let expanded = entry.expanded;
+                let folder_icon =
+                    FileIcons::get_folder_icon(expanded, entry.path.as_std_path(), cx)
+                        .map(|icon| {
+                            Icon::from_path(icon)
+                                .size(IconSize::Small)
+                                .color(Color::Muted)
+                        })
+                        .unwrap_or_else(|| {
+                            Icon::new(if expanded {
+                                IconName::FolderOpen
+                            } else {
+                                IconName::Folder
+                            })
+                            .size(IconSize::Small)
+                            .color(Color::Muted)
+                        });
+
+                ListItem::new(("branch-diff-directory", ix))
+                    .spacing(ListItemSpacing::Sparse)
+                    .indent_level(entry.depth)
+                    .indent_step_size(px(TREE_INDENT))
+                    .start_slot(folder_icon)
+                    .child(
+                        Label::new(entry.name.clone())
+                            .size(LabelSize::Small)
+                            .color(Color::Muted)
+                            .truncate(),
+                    )
+                    .tooltip({
+                        let name = entry.name.clone();
+                        move |_, cx| Tooltip::with_meta("Toggle Folder", None, name.clone(), cx)
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tree_expanded_dirs.insert(path.clone(), !expanded);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+            BranchDiffTreeEntry::File(entry) => {
+                let repo_path = entry.entry.repo_path.clone();
+                let status = entry.entry.status;
+                let selected = active_path == Some(&repo_path);
+                let file_name: SharedString = repo_path
+                    .file_name()
+                    .map(|name| name.to_string())
+                    .unwrap_or_default()
+                    .into();
+                let full_path: SharedString = repo_path.as_unix_str().to_string().into();
+
+                ListItem::new(("branch-diff-file", ix))
+                    .spacing(ListItemSpacing::Sparse)
+                    .indent_level(entry.depth)
+                    .indent_step_size(px(TREE_INDENT))
+                    .toggle_state(selected)
+                    .start_slot(git_status_icon(status))
+                    .child(Label::new(file_name).size(LabelSize::Small).truncate())
+                    .tooltip(move |_, cx| {
+                        Tooltip::with_meta("View Changes", None, full_path.clone(), cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.diff.update(cx, |diff, cx| {
+                            diff.move_to_repo_path(&repo_path, status, window, cx);
+                            diff.focus_handle(cx).focus(window, cx);
+                        });
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_tree(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let files = self.diff.read(cx).file_entries().to_vec();
+        let file_count = files.len();
+        let entries = Rc::new(build_branch_diff_tree_entries(
+            files,
+            &self.tree_expanded_dirs,
+        ));
+        let active_path = self.active_repo_path(cx);
+        let list_entries = entries.clone();
+        let indent_entries = entries.clone();
+
+        v_flex()
+            .w(BRANCH_DIFF_TREE_WIDTH)
+            .min_w(px(160.))
+            .max_w(px(360.))
+            .h_full()
+            .flex_shrink_0()
+            .overflow_hidden()
+            .bg(cx.theme().colors().editor_background)
+            .border_r_1()
+            .border_color(cx.theme().colors().border_variant)
+            .child(
+                h_flex()
+                    .h_8()
+                    .px_2()
+                    .justify_between()
+                    .border_b_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .child(Label::new("Files").size(LabelSize::Small))
+                    .child(
+                        Label::new(file_count.to_string())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .relative()
+                    .child(
+                        uniform_list(
+                            "branch-diff-tree-entries",
+                            entries.len(),
+                            cx.processor(move |this, range: Range<usize>, _window, cx| {
+                                range
+                                    .filter_map(|ix| {
+                                        list_entries.get(ix).map(|entry| {
+                                            this.render_tree_entry(
+                                                ix,
+                                                entry,
+                                                active_path.as_ref(),
+                                                cx,
+                                            )
+                                        })
+                                    })
+                                    .collect()
+                            }),
+                        )
+                        .with_decoration(
+                            ui::indent_guides(px(TREE_INDENT), IndentGuideColors::panel(cx))
+                                .with_left_offset(ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.))
+                                .with_compute_indents_fn(
+                                    cx.entity(),
+                                    move |_, range, _window, _cx| {
+                                        range
+                                            .map(|ix| {
+                                                indent_entries
+                                                    .get(ix)
+                                                    .map_or(0, BranchDiffTreeEntry::depth)
+                                            })
+                                            .collect()
+                                    },
+                                ),
+                        )
+                        .size_full()
+                        .track_scroll(&self.tree_scroll_handle),
+                    )
+                    .vertical_scrollbar_for(&self.tree_scroll_handle, window, cx),
+            )
+            .into_any_element()
     }
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
@@ -597,11 +931,16 @@ impl Item for BranchDiff {
 }
 
 impl Render for BranchDiff {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
             .size_full()
             .on_action(cx.listener(Self::review_diff))
-            .child(self.diff.clone())
+            .on_action(cx.listener(Self::toggle_tree))
+            .when(
+                self.show_tree && !self.diff.read(cx).file_entries().is_empty(),
+                |this| this.child(self.render_tree(window, cx)),
+            )
+            .child(div().flex_1().min_w_0().h_full().child(self.diff.clone()))
     }
 }
 
@@ -739,6 +1078,7 @@ impl Render for BranchDiffToolbar {
         };
         let selected_base_ref = base_ref.clone();
         let base_ref_label = format!("Base: {base_ref}");
+        let show_tree = branch_diff.read(cx).show_tree;
         let repository = branch_diff.read(cx).repo(cx);
         let workspace = branch_diff.read(cx).workspace.clone();
         let view_for_picker = branch_diff.downgrade();
@@ -767,6 +1107,25 @@ impl Render for BranchDiffToolbar {
                     deletions as usize,
                 ))
             })
+            .child(
+                IconButton::new("toggle-branch-diff-tree", IconName::ListTree)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(show_tree)
+                    .tooltip(move |_, cx| {
+                        Tooltip::for_action(
+                            if show_tree {
+                                "Hide File Tree"
+                            } else {
+                                "Show File Tree"
+                            },
+                            &ToggleBranchDiffTree,
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dispatch_action(&ToggleBranchDiffTree, window, cx);
+                    })),
+            )
             .child(Divider::vertical().ml_1())
             .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
@@ -844,7 +1203,10 @@ mod tests {
     use anyhow::anyhow;
     use collections::HashMap;
     use editor::test::editor_test_context::assert_state_with_diff;
-    use git::status::{FileStatus, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
+    use git::{
+        repository::repo_path,
+        status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
+    };
     use gpui::TestAppContext;
     use project::FakeFs;
     use serde_json::json;
@@ -857,6 +1219,69 @@ mod tests {
         rel_path::{RelPath, rel_path},
     };
     use workspace::MultiWorkspace;
+
+    fn tree_test_file(path: &str) -> DiffFileEntry {
+        DiffFileEntry {
+            repo_path: repo_path(path),
+            status: StatusCode::Modified.worktree(),
+        }
+    }
+
+    #[test]
+    fn test_branch_diff_tree_entries_and_collapsed_directories() {
+        let files = vec![
+            tree_test_file("src/lib/a.rs"),
+            tree_test_file("README.md"),
+            tree_test_file("tests/test.rs"),
+            tree_test_file("src/lib/b.rs"),
+        ];
+
+        let entries = build_branch_diff_tree_entries(files.clone(), &HashMap::default());
+        assert_eq!(entries.len(), 6);
+        assert!(matches!(
+            &entries[0],
+            BranchDiffTreeEntry::Directory(entry)
+                if entry.path == repo_path("src/lib")
+                    && entry.name.as_ref() == "src/lib"
+                    && entry.depth == 0
+                    && entry.expanded
+        ));
+        assert!(matches!(
+            &entries[1],
+            BranchDiffTreeEntry::File(entry)
+                if entry.entry.repo_path == repo_path("src/lib/a.rs") && entry.depth == 1
+        ));
+        assert!(matches!(
+            &entries[2],
+            BranchDiffTreeEntry::File(entry)
+                if entry.entry.repo_path == repo_path("src/lib/b.rs") && entry.depth == 1
+        ));
+        assert!(matches!(
+            &entries[3],
+            BranchDiffTreeEntry::Directory(entry)
+                if entry.path == repo_path("tests") && entry.depth == 0
+        ));
+        assert!(matches!(
+            &entries[5],
+            BranchDiffTreeEntry::File(entry)
+                if entry.entry.repo_path == repo_path("README.md") && entry.depth == 0
+        ));
+
+        let mut collapsed = HashMap::default();
+        collapsed.insert(repo_path("src/lib"), false);
+        let entries = build_branch_diff_tree_entries(files, &collapsed);
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(
+            &entries[0],
+            BranchDiffTreeEntry::Directory(entry) if !entry.expanded
+        ));
+        assert!(!entries.iter().any(|entry| matches!(
+            entry,
+            BranchDiffTreeEntry::File(entry)
+                if entry.entry.repo_path == repo_path("src/lib/a.rs")
+                    || entry.entry.repo_path == repo_path("src/lib/b.rs")
+        )));
+    }
 
     use super::*;
 

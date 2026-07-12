@@ -1,0 +1,68 @@
+name: Build Branch Diff Preview for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/branch-diff-tree-view
+
+permissions:
+  contents: read
+
+concurrency:
+  group: branch-diff-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-x86_64:
+    name: Windows x86_64 release
+    runs-on: windows-2022
+    timeout-minutes: 240
+    env:
+      CARGO_INCREMENTAL: 0
+      # The upstream CI value enables Azure signing, whose credentials are only
+      # available in the zed-industries repository. Fork builds are unsigned.
+      CI: ""
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Cache Rust build data
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: branch-diff-windows-x86_64
+          cache-on-failure: true
+
+      - name: Make Visual Studio available at the upstream script path
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vsPath) {
+            throw "Visual Studio with the x64 C++ toolchain was not found"
+          }
+
+          $communityPath = "C:\Program Files\Microsoft Visual Studio\2022\Community"
+          if (-not (Test-Path $communityPath)) {
+            New-Item -ItemType Junction -Path $communityPath -Target $vsPath | Out-Null
+          }
+
+      - name: Build unsigned preview installer
+        shell: pwsh
+        run: script/bundle-windows.ps1 -Architecture x86_64
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: Zed-Branch-Diff-Preview-x86_64
+          path: target/Zed-x86_64.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows remote server
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-windows-x86_64
+          path: target/zed-remote-server-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 14

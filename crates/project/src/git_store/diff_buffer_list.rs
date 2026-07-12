@@ -381,7 +381,7 @@ impl DiffBufferList {
                 output.push(DiffBuffer {
                     repo_path: item.repo_path.clone(),
                     load: task,
-                    file_status: item.status,
+                    file_status: status,
                 });
             }
             let Some(tree_diff) = self.tree_diff.as_ref() else {
