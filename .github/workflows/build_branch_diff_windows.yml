@@ -5,6 +5,8 @@ on:
   push:
     branches:
       - feature/branch-diff-tree-view
+    paths-ignore:
+      - ".github/workflows/**"
 
 permissions:
   contents: read

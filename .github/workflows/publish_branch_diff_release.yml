@@ -1,0 +1,43 @@
+name: Publish Branch Diff Preview Release
+
+on:
+  push:
+    branches:
+      - feature/branch-diff-tree-view
+    paths:
+      - ".github/workflows/publish_branch_diff_release.yml"
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish-release:
+    name: Publish Windows x86_64 installer
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified Windows installer
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 29200929180 \
+            --repo "${{ github.repository }}" \
+            --name Zed-Branch-Diff-Preview-x86_64 \
+            --dir dist
+
+      - name: Verify installer checksum
+        run: |
+          echo "ebf605329b1fd1eaf0e8a18e6968489e0de0e1b188fb5212830e122d32ed2e1a  dist/Zed-x86_64.exe" \
+            | sha256sum --check --strict
+
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create v1.11.2-branch-diff-tree \
+            dist/Zed-x86_64.exe#Zed-x86_64.exe \
+            --repo "${{ github.repository }}" \
+            --verify-tag \
+            --prerelease \
+            --title "Zed Preview 1.11.2 - Branch Diff Tree View" \
+            --notes "Custom Zed Preview build based on v1.11.2-pre. Adds a collapsible file tree sidebar to Git: Branch Diff with active-file highlighting, status icons, folder compaction, and click-to-navigate behavior. Built as an unsigned Windows x86_64 installer by GitHub Actions. SHA-256: ebf605329b1fd1eaf0e8a18e6968489e0de0e1b188fb5212830e122d32ed2e1a"
