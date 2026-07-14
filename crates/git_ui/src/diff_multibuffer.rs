@@ -63,6 +63,7 @@ pub struct DiffMultibuffer {
 pub(crate) struct DiffFileEntry {
     pub(crate) repo_path: RepoPath,
     pub(crate) status: FileStatus,
+    pub(crate) path_key: PathKey,
 }
 
 impl DiffMultibuffer {
@@ -255,20 +256,6 @@ impl DiffMultibuffer {
         self.move_to_path(path_key, window, cx)
     }
 
-    pub(crate) fn move_to_repo_path(
-        &mut self,
-        repo_path: &RepoPath,
-        status: FileStatus,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(git_repo) = self.branch_diff.read(cx).repo() else {
-            return;
-        };
-        let path_key = project_diff_path_key(&git_repo.read(cx), repo_path, status, cx);
-        self.move_to_path(path_key, window, cx);
-    }
-
     pub(crate) fn move_to_beginning(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editor.update(cx, |editor, cx| {
             editor.rhs_editor().update(cx, |editor, cx| {
@@ -286,8 +273,28 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) {
         if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+            // Path locations start at excerpt context; navigation should reveal
+            // the target buffer and land on its first actual diff hunk.
+            let snapshot = self.multibuffer.read(cx).snapshot(cx);
+            let target_buffer_id = snapshot
+                .anchor_to_buffer_anchor(position)
+                .map(|(anchor, _)| anchor.buffer_id);
+            let position = target_buffer_id
+                .and_then(|target_buffer_id| {
+                    self.editor
+                        .read(cx)
+                        .rhs_editor()
+                        .read(cx)
+                        .diff_hunks_in_ranges(&[position..multi_buffer::Anchor::Max], &snapshot)
+                        .find(|hunk| hunk.buffer_id == target_buffer_id)
+                        .map(|hunk| hunk.multi_buffer_range.start)
+                })
+                .unwrap_or(position);
             self.editor.update(cx, |editor, cx| {
                 editor.rhs_editor().update(cx, |editor, cx| {
+                    if let Some(buffer_id) = target_buffer_id {
+                        editor.unfold_buffer(buffer_id, cx);
+                    }
                     editor.change_selections(
                         SelectionEffects::scroll(Autoscroll::focused()),
                         window,
@@ -652,10 +659,11 @@ impl DiffMultibuffer {
                 }
             }
             this.file_entries = entries
-                .values()
-                .map(|entry| DiffFileEntry {
+                .iter()
+                .map(|(path_key, entry)| DiffFileEntry {
                     repo_path: entry.repo_path.clone(),
                     status: entry.file_status,
+                    path_key: path_key.clone(),
                 })
                 .collect();
 

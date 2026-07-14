@@ -554,6 +554,7 @@ impl BranchDiff {
             BranchDiffTreeEntry::File(entry) => {
                 let repo_path = entry.entry.repo_path.clone();
                 let status = entry.entry.status;
+                let path_key = entry.entry.path_key.clone();
                 let selected = active_path == Some(&repo_path);
                 let file_name: SharedString = repo_path
                     .file_name()
@@ -574,7 +575,7 @@ impl BranchDiff {
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.diff.update(cx, |diff, cx| {
-                            diff.move_to_repo_path(&repo_path, status, window, cx);
+                            diff.move_to_path(path_key.clone(), window, cx);
                             diff.focus_handle(cx).focus(window, cx);
                         });
                     }))
@@ -1221,8 +1222,10 @@ mod tests {
     use workspace::MultiWorkspace;
 
     fn tree_test_file(path: &str) -> DiffFileEntry {
+        let repo_path = repo_path(path);
         DiffFileEntry {
-            repo_path: repo_path(path),
+            path_key: multi_buffer::PathKey::with_sort_prefix(2, repo_path.clone().into_arc()),
+            repo_path,
             status: StatusCode::Modified.worktree(),
         }
     }
@@ -1281,6 +1284,164 @@ mod tests {
                 if entry.entry.repo_path == repo_path("src/lib/a.rs")
                     || entry.entry.repo_path == repo_path("src/lib/b.rs")
         )));
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_tree_navigation_targets_file_hunk_and_unfolds(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let base_text = (0..12)
+            .map(|line| format!("base line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let mut modified_lines = (0..12)
+            .map(|line| format!("base line {line}"))
+            .collect::<Vec<_>>();
+        modified_lines[9] = "changed line 9".into();
+        let modified_text = modified_lines.join("\n") + "\n";
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "modified.txt": modified_text.clone(),
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let branch_diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        fs.set_head_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("deleted.txt", "deleted from worktree\n".into()),
+                ("modified.txt", modified_text),
+            ],
+            "head",
+        );
+        fs.set_merge_base_content_for_repo(
+            path!("/project/.git").as_ref(),
+            &[
+                ("deleted.txt", "deleted from worktree\n".into()),
+                ("modified.txt", base_text),
+            ],
+        );
+        cx.run_until_parked();
+
+        let (deleted_entry, modified_entry, editor) =
+            branch_diff.read_with(cx, |branch_diff, cx| {
+                let diff = branch_diff.diff.read(cx);
+                let deleted_entry = diff
+                    .file_entries()
+                    .iter()
+                    .find(|entry| entry.repo_path == repo_path("deleted.txt"))
+                    .cloned()
+                    .unwrap();
+                let modified_entry = diff
+                    .file_entries()
+                    .iter()
+                    .find(|entry| entry.repo_path == repo_path("modified.txt"))
+                    .cloned()
+                    .unwrap();
+                (
+                    deleted_entry,
+                    modified_entry,
+                    diff.editor().read(cx).rhs_editor().clone(),
+                )
+            });
+        let deleted_buffer_id = editor.read_with(cx, |editor, cx| {
+            editor
+                .buffer()
+                .read(cx)
+                .all_buffers()
+                .iter()
+                .find(|buffer| {
+                    buffer
+                        .read(cx)
+                        .file()
+                        .is_some_and(|file| file.path().as_unix_str() == "deleted.txt")
+                })
+                .unwrap()
+                .read(cx)
+                .remote_id()
+        });
+        assert!(editor.read_with(cx, |editor, cx| {
+            editor.is_buffer_folded(deleted_buffer_id, cx)
+        }));
+
+        cx.update_window_entity(&branch_diff, |branch_diff, window, cx| {
+            branch_diff.diff.update(cx, |diff, cx| {
+                diff.move_to_path(deleted_entry.path_key, window, cx)
+            });
+        });
+        let active_path = branch_diff.read_with(cx, |branch_diff, cx| {
+            branch_diff
+                .diff
+                .read(cx)
+                .active_project_path(cx)
+                .unwrap()
+                .path
+                .as_unix_str()
+                .to_string()
+        });
+        assert_eq!(active_path, "deleted.txt");
+        assert!(!editor.read_with(cx, |editor, cx| {
+            editor.is_buffer_folded(deleted_buffer_id, cx)
+        }));
+
+        cx.update_window_entity(&branch_diff, |branch_diff, window, cx| {
+            branch_diff.diff.update(cx, |diff, cx| {
+                diff.move_to_path(modified_entry.path_key, window, cx)
+            });
+        });
+        let (active_path, selection, first_hunk_start) =
+            branch_diff.read_with(cx, |branch_diff, cx| {
+                let diff = branch_diff.diff.read(cx);
+                let active_path = diff
+                    .active_project_path(cx)
+                    .unwrap()
+                    .path
+                    .as_unix_str()
+                    .to_string();
+                let editor = diff.editor().read(cx).rhs_editor().read(cx);
+                let selection = editor.selections.newest_anchor().head();
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let target_buffer_id = snapshot
+                    .anchor_to_buffer_anchor(selection)
+                    .unwrap()
+                    .0
+                    .buffer_id;
+                let first_hunk_start = editor
+                    .diff_hunks_in_ranges(
+                        &[multi_buffer::Anchor::Min..multi_buffer::Anchor::Max],
+                        &snapshot,
+                    )
+                    .find(|hunk| hunk.buffer_id == target_buffer_id)
+                    .unwrap()
+                    .multi_buffer_range
+                    .start;
+                let selection = snapshot.anchor_to_buffer_anchor(selection).unwrap().0;
+                let first_hunk_start = snapshot
+                    .anchor_to_buffer_anchor(first_hunk_start)
+                    .unwrap()
+                    .0;
+                (active_path, selection, first_hunk_start)
+            });
+        assert_eq!(active_path, "modified.txt");
+        assert_eq!(selection, first_hunk_start);
     }
 
     use super::*;
