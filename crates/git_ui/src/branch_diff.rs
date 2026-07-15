@@ -1266,12 +1266,12 @@ mod tests {
         status::{FileStatus, StatusCode, TrackedStatus, UnmergedStatus, UnmergedStatusCode},
     };
     use gpui::TestAppContext;
+    use language::ToOffset as _;
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
     use std::path::Path;
     use std::sync::Arc;
-    use text::ToOffset as _;
     use unindent::Unindent as _;
     use util::{
         path,
