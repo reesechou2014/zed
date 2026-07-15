@@ -1271,6 +1271,7 @@ mod tests {
     use settings::{DiffViewStyle, SettingsStore};
     use std::path::Path;
     use std::sync::Arc;
+    use text::ToOffset as _;
     use unindent::Unindent as _;
     use util::{
         path,
@@ -1530,11 +1531,13 @@ mod tests {
                     .unwrap()
                     .multi_buffer_range
                     .start;
-                let selection = snapshot.anchor_to_buffer_anchor(selection).unwrap().0;
-                let first_hunk_start = snapshot
-                    .anchor_to_buffer_anchor(first_hunk_start)
-                    .unwrap()
-                    .0;
+                let (selection, selection_buffer) =
+                    snapshot.anchor_to_buffer_anchor(selection).unwrap();
+                let (first_hunk_start, hunk_buffer) =
+                    snapshot.anchor_to_buffer_anchor(first_hunk_start).unwrap();
+                assert_eq!(selection.buffer_id, first_hunk_start.buffer_id);
+                let selection = selection.to_offset(selection_buffer);
+                let first_hunk_start = first_hunk_start.to_offset(hunk_buffer);
                 (active_path, selection, first_hunk_start)
             });
         assert_eq!(active_path, "modified.txt");
