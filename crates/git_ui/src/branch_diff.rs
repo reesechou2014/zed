@@ -16,9 +16,9 @@ use editor::{
 use file_icons::FileIcons;
 use git::{repository::DiffType, status::FileStatus};
 use gpui::{
-    Action, AnyElement, App, AppContext as _, Entity, EventEmitter, FocusHandle, Focusable, Pixels,
-    Render, ScrollStrategy, SharedString, Subscription, Task, UniformListScrollHandle, WeakEntity,
-    actions, px, uniform_list,
+    Action, AnyElement, App, AppContext as _, ClickEvent, DragMoveEvent, Entity, EventEmitter,
+    FocusHandle, Focusable, MouseButton, Pixels, Render, ScrollStrategy, SharedString,
+    Subscription, Task, UniformListScrollHandle, WeakEntity, actions, deferred, px, uniform_list,
 };
 use language::{BufferId, Capability};
 use project::{
@@ -48,8 +48,18 @@ use workspace::{
 };
 use zed_actions::agent::ReviewBranchDiff;
 
-const BRANCH_DIFF_TREE_WIDTH: Pixels = px(240.);
+const BRANCH_DIFF_TREE_DEFAULT_WIDTH: Pixels = px(240.);
+const BRANCH_DIFF_TREE_MIN_WIDTH: Pixels = px(160.);
+const BRANCH_DIFF_EDITOR_MIN_WIDTH: Pixels = px(240.);
+const BRANCH_DIFF_TREE_RESIZE_HANDLE_WIDTH: Pixels = px(8.);
 const TREE_INDENT: f32 = 20.;
+
+struct DraggedBranchDiffTreeResizeHandle;
+
+fn clamped_branch_diff_tree_width(requested: Pixels, available: Pixels) -> Pixels {
+    let max_width = (available - BRANCH_DIFF_EDITOR_MIN_WIDTH).max(BRANCH_DIFF_TREE_MIN_WIDTH);
+    requested.clamp(BRANCH_DIFF_TREE_MIN_WIDTH, max_width)
+}
 
 actions!(
     git,
@@ -69,6 +79,7 @@ pub struct BranchDiff {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     show_tree: bool,
+    tree_width: Pixels,
     tree_expanded_dirs: HashMap<git::repository::RepoPath, bool>,
     tree_scroll_handle: UniformListScrollHandle,
     _subscriptions: Subscription,
@@ -483,6 +494,7 @@ impl BranchDiff {
             project,
             workspace: workspace.downgrade(),
             show_tree: true,
+            tree_width: BRANCH_DIFF_TREE_DEFAULT_WIDTH,
             tree_expanded_dirs: HashMap::default(),
             tree_scroll_handle: UniformListScrollHandle::new(),
             _subscriptions: Subscription::join(diff_event_subscription, diff_observation),
@@ -576,7 +588,12 @@ impl BranchDiff {
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.diff.update(cx, |diff, cx| {
                             diff.move_to_path(path_key.clone(), window, cx);
-                            diff.focus_handle(cx).focus(window, cx);
+                            diff.editor()
+                                .read(cx)
+                                .rhs_editor()
+                                .read(cx)
+                                .focus_handle(cx)
+                                .focus(window, cx);
                         });
                     }))
                     .into_any_element()
@@ -595,75 +612,107 @@ impl BranchDiff {
         let list_entries = entries.clone();
         let indent_entries = entries.clone();
 
-        v_flex()
-            .w(BRANCH_DIFF_TREE_WIDTH)
-            .min_w(px(160.))
-            .max_w(px(360.))
+        div()
+            .id("branch-diff-tree-container")
+            .relative()
+            .w(self.tree_width)
+            .min_w(BRANCH_DIFF_TREE_MIN_WIDTH)
             .h_full()
             .flex_shrink_0()
-            .overflow_hidden()
-            .bg(cx.theme().colors().editor_background)
-            .border_r_1()
-            .border_color(cx.theme().colors().border_variant)
             .child(
-                h_flex()
-                    .h_8()
-                    .px_2()
-                    .justify_between()
-                    .border_b_1()
+                v_flex()
+                    .size_full()
+                    .overflow_hidden()
+                    .bg(cx.theme().colors().editor_background)
+                    .border_r_1()
                     .border_color(cx.theme().colors().border_variant)
-                    .child(Label::new("Files").size(LabelSize::Small))
                     .child(
-                        Label::new(file_count.to_string())
-                            .size(LabelSize::XSmall)
-                            .color(Color::Muted),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
+                        h_flex()
+                            .h_8()
+                            .px_2()
+                            .justify_between()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border_variant)
+                            .child(Label::new("Files").size(LabelSize::Small))
+                            .child(
+                                Label::new(file_count.to_string())
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            ),
+                    )
                     .child(
-                        uniform_list(
-                            "branch-diff-tree-entries",
-                            entries.len(),
-                            cx.processor(move |this, range: Range<usize>, _window, cx| {
-                                range
-                                    .filter_map(|ix| {
-                                        list_entries.get(ix).map(|entry| {
-                                            this.render_tree_entry(
-                                                ix,
-                                                entry,
-                                                active_path.as_ref(),
-                                                cx,
-                                            )
-                                        })
-                                    })
-                                    .collect()
-                            }),
-                        )
-                        .with_decoration(
-                            ui::indent_guides(px(TREE_INDENT), IndentGuideColors::panel(cx))
-                                .with_left_offset(ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.))
-                                .with_compute_indents_fn(
-                                    cx.entity(),
-                                    move |_, range, _window, _cx| {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .child(
+                                uniform_list(
+                                    "branch-diff-tree-entries",
+                                    entries.len(),
+                                    cx.processor(move |this, range: Range<usize>, _window, cx| {
                                         range
-                                            .map(|ix| {
-                                                indent_entries
-                                                    .get(ix)
-                                                    .map_or(0, BranchDiffTreeEntry::depth)
+                                            .filter_map(|ix| {
+                                                list_entries.get(ix).map(|entry| {
+                                                    this.render_tree_entry(
+                                                        ix,
+                                                        entry,
+                                                        active_path.as_ref(),
+                                                        cx,
+                                                    )
+                                                })
                                             })
                                             .collect()
-                                    },
-                                ),
-                        )
-                        .size_full()
-                        .track_scroll(&self.tree_scroll_handle),
-                    )
-                    .vertical_scrollbar_for(&self.tree_scroll_handle, window, cx),
+                                    }),
+                                )
+                                .with_decoration(
+                                    ui::indent_guides(
+                                        px(TREE_INDENT),
+                                        IndentGuideColors::panel(cx),
+                                    )
+                                    .with_left_offset(
+                                        ui::LIST_ITEM_INDENT_GUIDE_LEFT_OFFSET - px(2.),
+                                    )
+                                    .with_compute_indents_fn(
+                                        cx.entity(),
+                                        move |_, range, _window, _cx| {
+                                            range
+                                                .map(|ix| {
+                                                    indent_entries
+                                                        .get(ix)
+                                                        .map_or(0, BranchDiffTreeEntry::depth)
+                                                })
+                                                .collect()
+                                        },
+                                    ),
+                                )
+                                .size_full()
+                                .track_scroll(&self.tree_scroll_handle),
+                            )
+                            .vertical_scrollbar_for(&self.tree_scroll_handle, window, cx),
+                    ),
             )
+            .child(deferred(
+                div()
+                    .id("branch-diff-tree-resize-handle")
+                    .absolute()
+                    .right(-BRANCH_DIFF_TREE_RESIZE_HANDLE_WIDTH / 2.)
+                    .top_0()
+                    .h_full()
+                    .w(BRANCH_DIFF_TREE_RESIZE_HANDLE_WIDTH)
+                    .cursor_col_resize()
+                    .block_mouse_except_scroll()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+                        if event.click_count() >= 2 {
+                            this.tree_width = BRANCH_DIFF_TREE_DEFAULT_WIDTH;
+                            cx.notify();
+                        }
+                        cx.stop_propagation();
+                    }))
+                    .on_drag(DraggedBranchDiffTreeResizeHandle, |_, _, _, cx| {
+                        cx.new(|_| gpui::Empty)
+                    }),
+            ))
             .into_any_element()
     }
 
@@ -937,6 +986,14 @@ impl Render for BranchDiff {
             .size_full()
             .on_action(cx.listener(Self::review_diff))
             .on_action(cx.listener(Self::toggle_tree))
+            .on_drag_move::<DraggedBranchDiffTreeResizeHandle>(cx.listener(
+                |this, event: &DragMoveEvent<DraggedBranchDiffTreeResizeHandle>, _, cx| {
+                    let requested = event.event.position.x - event.bounds.left();
+                    this.tree_width =
+                        clamped_branch_diff_tree_width(requested, event.bounds.size.width);
+                    cx.notify();
+                },
+            ))
             .when(
                 self.show_tree && !self.diff.read(cx).file_entries().is_empty(),
                 |this| this.child(self.render_tree(window, cx)),
@@ -1286,11 +1343,32 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn test_branch_diff_tree_width_is_clamped_to_available_space() {
+        assert_eq!(
+            clamped_branch_diff_tree_width(px(120.), px(1000.)),
+            BRANCH_DIFF_TREE_MIN_WIDTH
+        );
+        assert_eq!(
+            clamped_branch_diff_tree_width(px(480.), px(1000.)),
+            px(480.)
+        );
+        assert_eq!(
+            clamped_branch_diff_tree_width(px(900.), px(1000.)),
+            px(760.)
+        );
+    }
+
     #[gpui::test]
     async fn test_branch_diff_tree_navigation_targets_file_hunk_and_unfolds(
         cx: &mut TestAppContext,
     ) {
         init_test(cx);
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.editor.diff_view_style = Some(DiffViewStyle::Split);
+            });
+        });
 
         let base_text = (0..12)
             .map(|line| format!("base line {line}"))
@@ -1309,6 +1387,7 @@ mod tests {
             json!({
                 ".git": {},
                 "modified.txt": modified_text.clone(),
+                "z-last.txt": "z current\n",
             }),
         )
         .await;
@@ -1329,6 +1408,7 @@ mod tests {
             &[
                 ("deleted.txt", "deleted from worktree\n".into()),
                 ("modified.txt", modified_text),
+                ("z-last.txt", "z current\n".into()),
             ],
             "head",
         );
@@ -1337,11 +1417,12 @@ mod tests {
             &[
                 ("deleted.txt", "deleted from worktree\n".into()),
                 ("modified.txt", base_text),
+                ("z-last.txt", "z base\n".into()),
             ],
         );
         cx.run_until_parked();
 
-        let (deleted_entry, modified_entry, editor) =
+        let (deleted_entry, modified_entry, splittable_editor, editor) =
             branch_diff.read_with(cx, |branch_diff, cx| {
                 let diff = branch_diff.diff.read(cx);
                 let deleted_entry = diff
@@ -1359,9 +1440,11 @@ mod tests {
                 (
                     deleted_entry,
                     modified_entry,
+                    diff.editor().clone(),
                     diff.editor().read(cx).rhs_editor().clone(),
                 )
             });
+        assert!(splittable_editor.read_with(cx, |editor, _| editor.is_split()));
         let deleted_buffer_id = editor.read_with(cx, |editor, cx| {
             editor
                 .buffer()
@@ -1403,10 +1486,24 @@ mod tests {
         }));
 
         cx.update_window_entity(&branch_diff, |branch_diff, window, cx| {
+            splittable_editor
+                .read(cx)
+                .lhs_editor()
+                .unwrap()
+                .read(cx)
+                .focus_handle(cx)
+                .focus(window, cx);
             branch_diff.diff.update(cx, |diff, cx| {
-                diff.move_to_path(modified_entry.path_key, window, cx)
+                diff.move_to_path(modified_entry.path_key, window, cx);
+                diff.editor()
+                    .read(cx)
+                    .rhs_editor()
+                    .read(cx)
+                    .focus_handle(cx)
+                    .focus(window, cx);
             });
         });
+        cx.run_until_parked();
         let (active_path, selection, first_hunk_start) =
             branch_diff.read_with(cx, |branch_diff, cx| {
                 let diff = branch_diff.diff.read(cx);

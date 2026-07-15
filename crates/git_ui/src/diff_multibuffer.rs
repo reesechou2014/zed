@@ -273,8 +273,6 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) {
         if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
-            // Path locations start at excerpt context; navigation should reveal
-            // the target buffer and land on its first actual diff hunk.
             let snapshot = self.multibuffer.read(cx).snapshot(cx);
             let target_buffer_id = snapshot
                 .anchor_to_buffer_anchor(position)
@@ -285,7 +283,10 @@ impl DiffMultibuffer {
                         .read(cx)
                         .rhs_editor()
                         .read(cx)
-                        .diff_hunks_in_ranges(&[position..multi_buffer::Anchor::Max], &snapshot)
+                        .diff_hunks_in_ranges(
+                            &[multi_buffer::Anchor::Min..multi_buffer::Anchor::Max],
+                            &snapshot,
+                        )
                         .find(|hunk| hunk.buffer_id == target_buffer_id)
                         .map(|hunk| hunk.multi_buffer_range.start)
                 })
@@ -296,11 +297,11 @@ impl DiffMultibuffer {
                         editor.unfold_buffer(buffer_id, cx);
                     }
                     editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::focused()),
+                        SelectionEffects::scroll(Autoscroll::focused().for_anchor(position)),
                         window,
                         cx,
                         |s| {
-                            s.select_ranges([position..position]);
+                            s.select_anchor_ranges([position..position]);
                         },
                     )
                 })
